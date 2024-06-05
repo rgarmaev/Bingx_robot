@@ -41,7 +41,6 @@ def send_request(method, path, urlpa, payload):
     }
     response = requests.request(method, url, headers=headers, data=payload)
 
-    # Преобразуем ответ в JSON
     response_json = response.json()
     return response_json
 
