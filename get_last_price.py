@@ -4,8 +4,8 @@ import hmac
 from hashlib import sha256
 
 APIURL = "https://open-api.bingx.com"
-APIKEY = "EuW8fOL9il9ywUiI1qjzb06WkgwbOIGfIZANTcLOq8QHj4jfVsnGykgqZRdBRdfBjUZpigiLoyfRnj3rMSw"
-SECRETKEY = "35MrDlIprD0zPupEaTKG1xwCxGlvVMGKAUAu0A2wBuDuUtcoACwLPGBRbXK3H20sT4YoD6srm17XjCTVtUr8g"
+APIKEY = "$$$"
+SECRETKEY = "$$$"
 
 
 def demo():
