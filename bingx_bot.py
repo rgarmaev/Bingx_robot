@@ -8,7 +8,9 @@ import aiohttp
 import logging
 
 # Конфигурация логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+LOG_LEVEL_STR = os.getenv('LOG_LEVEL', 'INFO').upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 # ------------------ Config ------------------
@@ -101,6 +103,7 @@ class TelegramNotifier:
 
     async def send(self, text: str) -> bool:
         if not self.base_url or not self.chat_id:
+            logger.debug('Telegram send skipped: missing token/chat_id')
             return False
         url = f"{self.base_url}/sendMessage"
         payload = {
@@ -116,6 +119,7 @@ class TelegramNotifier:
                         t = await resp.text()
                         logger.error('Telegram send failed [%s]: %s', resp.status, t)
                         return False
+            logger.debug('Telegram message sent')
             return True
         except Exception as e:
             logger.error('Telegram error: %s', e)
@@ -325,7 +329,7 @@ class Indicators:
         return sum(trs) / float(period) if trs else None
 
     @staticmethod
-    def find_swings(candles: List[Dict[str, float]], lookback: int = 2) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def find_swings(candles: List[Dict[str, Any]], lookback: int = 2) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         swing_highs: List[Dict[str, Any]] = []
         swing_lows: List[Dict[str, Any]] = []
         if len(candles) < lookback * 2 + 1:
@@ -499,12 +503,15 @@ class Strategy:
         return 0
 
     async def evaluate(self) -> Optional[Dict[str, Any]]:
+        logger.debug('Strategy.evaluate tick')
         candles = self.market.get_candles()
         if len(candles) < MIN_HISTORY_FOR_SIGNAL:
+            logger.debug('Skip: not enough candles (%s < %s)', len(candles), MIN_HISTORY_FOR_SIGNAL)
             return None
         # Evaluate только на новой свече
         last_ts = candles[-1]['timestamp']
         if self._last_eval_ts == last_ts:
+            logger.debug('Skip: no new candle (last_ts=%s)', last_ts)
             return None
         self._last_eval_ts = last_ts
 
@@ -515,13 +522,16 @@ class Strategy:
         weekly = self.market.get_weekly_candles()
 
         self.trend_bias = self._compute_trend_bias(one_h, four_h, daily, weekly)
+        logger.debug('Trend bias=%s', self.trend_bias)
 
         atr = Indicators.calculate_atr(candles, ATR_PERIOD)
         if atr is None:
+            logger.debug('Skip: ATR is None')
             return None
 
         last_price = self.market.get_last_price()
         if last_price is None:
+            logger.debug('Skip: last_price is None')
             return None
 
         # Фильтр по спреду
@@ -533,11 +543,13 @@ class Strategy:
             best_ask = float(asks[0][0])
             spread = best_ask - best_bid
             if spread / last_price > 0.0004:  # 4 б.п.
+                logger.debug('Skip: spread too high (spread=%s)', spread)
                 return None
 
         # Фильтр волатильности: ATR/Price должен быть в адекватном диапазоне
         atr_ratio = atr / last_price
         if not (0.0005 <= atr_ratio <= 0.03):  # 5 б.п. - 3%
+            logger.debug('Skip: atr_ratio out of range (%.6f)', atr_ratio)
             return None
 
         # ---------- SMC-like swing/internal structure and alerts ----------
@@ -547,9 +559,11 @@ class Strategy:
         struct_trend = Indicators.detect_structure_trend(swing_highs, swing_lows)
         bos, choch = Indicators.detect_bos_choch(candles, struct_trend)
         fvg = Indicators.detect_fvg(candles, lookback=80)
+        logger.debug('Signals: bos=%s, choch=%s, fvg=%s', bool(bos), bool(choch), bool(fvg))
 
         # Кулдаун
         if time.time() < self._cooldown_until_ts:
+            logger.debug('Skip: cooldown (%.1fs left)', self._cooldown_until_ts - time.time())
             return None
 
         candidate: Optional[Dict[str, Any]] = None
@@ -572,12 +586,13 @@ class Strategy:
         if bos and ((self.trend_bias == 1 and bos['side'] == 'Buy') or (self.trend_bias == -1 and bos['side'] == 'Sell')):
             entry, stop, take = make_levels(bos['side'])
             rr = Indicators.calculate_risk_reward(entry, stop, take)
+            logger.debug('BOS candidate rr=%.2f', rr)
             if rr >= MIN_RR:
                 candidate = {'side': bos['side'], 'level': entry, 'stop': stop, 'take': take, 'reason': bos['reason']}
         elif choch and self.trend_bias == 0:
-            # Берём только когда HTF не определён, торгуем разворот CHoCH
             entry, stop, take = make_levels(choch['side'])
             rr = Indicators.calculate_risk_reward(entry, stop, take)
+            logger.debug('CHoCH candidate rr=%.2f', rr)
             if rr >= MIN_RR:
                 candidate = {'side': choch['side'], 'level': entry, 'stop': stop, 'take': take, 'reason': choch['reason']}
 
@@ -585,12 +600,14 @@ class Strategy:
         if candidate and fvg:
             side = candidate['side']
             within = False
+            lower = upper = None
             if side == 'Buy' and fvg['type'] == 'FVG_LONG':
                 lower, upper = fvg['lower'], fvg['upper']
                 within = (lower - 0.25 * atr) <= last_price <= (upper + 0.25 * atr)
             elif side == 'Sell' and fvg['type'] == 'FVG_SHORT':
                 lower, upper = fvg['lower'], fvg['upper']
                 within = (lower - 0.25 * atr) <= last_price <= (upper + 0.25 * atr)
+            logger.debug('FVG filter within=%s zone=[%s,%s] price=%.4f', within, lower, upper, last_price)
             if not within:
                 candidate = None
 
@@ -606,8 +623,10 @@ class Strategy:
                     f"Reason: <i>{candidate['reason']}</i>"
                 )
                 asyncio.create_task(self.notifier.send(txt))
+            logger.info('Signal: %s %s at %s (reason=%s, Stop: %s, Take: %s)', candidate['side'], SYMBOL, round(candidate['level'], 2), candidate['reason'], round(candidate['stop'], 2), round(candidate['take'], 2))
             return candidate
 
+        logger.debug('No candidate this tick')
         return None
 
     # ---------- SMC helpers ----------
@@ -736,10 +755,12 @@ async def main_loop():
                 await asyncio.sleep(5)
 
     ws_task = asyncio.create_task(ws_runner())
+    logger.debug('WS runner started')
 
     try:
         while True:
             try:
+                logger.debug('Main loop tick')
                 signal = await strategy.evaluate()
                 if signal:
                     logger.info('Signal: %s %s at %s (reason=%s, Stop: %s, Take: %s)', signal['side'], SYMBOL, round(signal['level'], 2), signal['reason'], round(signal['stop'], 2), round(signal['take'], 2))
