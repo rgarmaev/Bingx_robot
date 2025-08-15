@@ -1,8 +1,6 @@
 import os
 import asyncio
 import json
-import hmac
-import hashlib
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -719,60 +717,12 @@ class Strategy:
     def on_position_update(self, pos_side: Optional[str]):
         self.position = pos_side
 
-# ------------------ Executor (REST) ------------------
-class Executor:
-    def __init__(self, api_key: Optional[str], api_secret: Optional[str]):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.base = REST_BASE
-
-    async def place_order(self, symbol: str, side: str, qty: float, price: Optional[float] = None, reduce_only: bool = False) -> Dict[str, Any]:
-        """Упрощённый MARKET-ордер BingX V2.
-        Примечание: В ряде случаев BingX ожидает query+sign, а не чистый JSON. Здесь оставлена простая форма.
-        """
-        path = '/openApi/swap/v2/trade/order'
-        url = self.base + path
-        ts = int(time.time() * 1000)
-        params = {
-            'symbol': symbol,
-            'side': side.upper(),
-            'type': 'MARKET',
-            'quantity': str(qty),
-            'timestamp': str(ts)
-        }
-        if reduce_only:
-            params['reduceOnly'] = 'true'
-
-        if not self.api_secret or not self.api_key:
-            return {'code': -1, 'msg': 'missing_api_keys', 'params': params}
-
-        query_str = '&'.join([f"{k}={params[k]}" for k in sorted(params)])
-        sign = hmac.new(self.api_secret.encode(), query_str.encode(), hashlib.sha256).hexdigest()
-        params['sign'] = sign
-
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                'Content-Type': 'application/json',
-                'X-BX-APIKEY': self.api_key
-            }
-            async with session.post(url, json=params, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                text = await resp.text()
-                try:
-                    result = json.loads(text)
-                    if result.get('code') != 0:
-                        logger.error('Order failed: %s', result.get('msg'))
-                    return result
-                except Exception as e:
-                    logger.error('Failed to parse response: %s, error: %s', text, e)
-                    return {'raw': text, 'error': str(e)}
-
 # ------------------ Main loop ------------------
 async def main_loop():
     logger.info("Запуск основного цикла")
     market = MarketData(SYMBOL, INTERVAL)
     notifier = TelegramNotifier(TG_BOT_TOKEN, TG_CHAT_ID)
     strategy = Strategy(market, notifier=notifier)
-    executor = Executor(API_KEY, API_SECRET)
 
     # Инициализация историей до старта WS
     await market.seed_current_interval(limit=300)
@@ -792,13 +742,7 @@ async def main_loop():
             try:
                 signal = await strategy.evaluate()
                 if signal:
-                    qty = float(os.getenv('QTY', '0.001'))
-                    if executor.api_key and executor.api_secret:
-                        logger.info('Постановка ордера: %s %s по %s (Stop: %s, Take: %s, %s)', signal['side'], SYMBOL, round(signal['level'], 2), round(signal['stop'], 2), round(signal['take'], 2), signal['reason'])
-                        res = await executor.place_order(SYMBOL, signal['side'], qty)
-                        logger.info('Ответ ордера: %s', res)
-                    else:
-                        logger.info('СИМУЛЯЦИЯ: %s %s по %s (причина=%s, Stop: %s, Take: %s)', signal['side'], SYMBOL, round(signal['level'], 2), signal['reason'], round(signal['stop'], 2), round(signal['take'], 2))
+                    logger.info('Signal: %s %s at %s (reason=%s, Stop: %s, Take: %s)', signal['side'], SYMBOL, round(signal['level'], 2), signal['reason'], round(signal['stop'], 2), round(signal['take'], 2))
             except Exception as e:
                 logger.error('Ошибка стратегии: %s', e)
             await asyncio.sleep(2)
