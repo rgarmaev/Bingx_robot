@@ -49,6 +49,10 @@ INTERVAL = os.getenv('INTERVAL', '15m')
 USE_TESTNET = os.getenv('USE_TESTNET', 'false').lower() in ('1', 'true', 'yes')
 API_KEY, API_SECRET = read_api_credentials()
 
+# Telegram notif config
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN')
+TG_CHAT_ID = os.getenv('TG_CHAT_ID')  # numeric chat id or @channelusername
+
 # BingX V2 endpoints
 WS_REST_PUBLIC = 'wss://open-api-ws.bingx.com/market'
 REST_BASE = 'https://open-api.bingx.com'
@@ -59,6 +63,41 @@ MIN_HISTORY_FOR_SIGNAL = 120  # минимум свечей на ТФ для с�
 ATR_PERIOD = 14
 MIN_RR = 2.0
 COOLDOWN_SECS = 90  # кулдаун между сигналами
+
+# SMC-like parameters (mapping from Pine)
+SWINGS_LENGTH = int(os.getenv('SWINGS_LENGTH', '50'))  # аналог swingsLengthInput
+INTERNAL_LENGTH = int(os.getenv('INTERNAL_LENGTH', '5'))  # аналог внутренней структуры
+EQUAL_LENGTH = int(os.getenv('EQUAL_LENGTH', '3'))
+EQUAL_THRESHOLD = float(os.getenv('EQUAL_THRESHOLD', '0.1'))  # как доля ATR(200)
+
+# ------------------ Telegram ------------------
+class TelegramNotifier:
+    def __init__(self, token: Optional[str], chat_id: Optional[str]):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}" if token else None
+
+    async def send(self, text: str) -> bool:
+        if not self.base_url or not self.chat_id:
+            return False
+        url = f"{self.base_url}/sendMessage"
+        payload = {
+            'chat_id': self.chat_id,
+            'text': text,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        t = await resp.text()
+                        logger.error('Telegram send failed [%s]: %s', resp.status, t)
+                        return False
+            return True
+        except Exception as e:
+            logger.error('Telegram error: %s', e)
+            return False
 
 # ------------------ Market Data ------------------
 class MarketData:
@@ -351,14 +390,58 @@ class Indicators:
             return 0.0
         return reward / risk
 
+    @staticmethod
+    def atr(candles: List[Dict[str, float]], period: int) -> Optional[float]:
+        return Indicators.calculate_atr(candles, period)
+
+    @staticmethod
+    def is_pivot_high(candles: List[Dict[str, float]], idx: int, lookback: int) -> bool:
+        if idx - lookback < 0 or idx + lookback >= len(candles):
+            return False
+        pivot_high = candles[idx]['high']
+        for j in range(idx - lookback, idx + lookback + 1):
+            if j == idx:
+                continue
+            if candles[j]['high'] > pivot_high:
+                return False
+        return True
+
+    @staticmethod
+    def is_pivot_low(candles: List[Dict[str, float]], idx: int, lookback: int) -> bool:
+        if idx - lookback < 0 or idx + lookback >= len(candles):
+            return False
+        pivot_low = candles[idx]['low']
+        for j in range(idx - lookback, idx + lookback + 1):
+            if j == idx:
+                continue
+            if candles[j]['low'] < pivot_low:
+                return False
+        return True
+
 # ------------------ Strategy ------------------
 class Strategy:
-    def __init__(self, market: MarketData):
+    def __init__(self, market: MarketData, notifier: Optional[TelegramNotifier] = None):
         self.market = market
+        self.notifier = notifier
         self.position: Optional[str] = None  # 'LONG' / 'SHORT' / None
         self.trend_bias = 0  # 1 / -1 / 0
         self._last_eval_ts: Optional[int] = None
         self._cooldown_until_ts: float = 0.0
+        # SMC state
+        self.swing_bias = 0
+        self.internal_bias = 0
+        self.swing_high_level: Optional[float] = None
+        self.swing_low_level: Optional[float] = None
+        self.internal_high_level: Optional[float] = None
+        self.internal_low_level: Optional[float] = None
+        self.swing_high_crossed = False
+        self.swing_low_crossed = False
+        self.internal_high_crossed = False
+        self.internal_low_crossed = False
+        self._last_fvg_type: Optional[str] = None
+        self._last_fvg_ts: Optional[int] = None
+        self._last_equal_high_ts: Optional[int] = None
+        self._last_equal_low_ts: Optional[int] = None
 
     async def _update_timeframes(self) -> None:
         await asyncio.gather(
@@ -435,6 +518,9 @@ class Strategy:
         if not (0.0005 <= atr_ratio <= 0.03):  # 5 б.п. - 3%
             return None
 
+        # ---------- SMC-like swing/internal structure and alerts ----------
+        await self._smc_alerts(candles)
+
         swing_highs, swing_lows = Indicators.find_swings(candles, lookback=2)
         struct_trend = Indicators.detect_structure_trend(swing_highs, swing_lows)
         bos, choch = Indicators.detect_bos_choch(candles, struct_trend)
@@ -489,9 +575,122 @@ class Strategy:
         if candidate:
             # Устанавливаем кулдаун
             self._cooldown_until_ts = time.time() + COOLDOWN_SECS
+            # Telegram notify
+            if self.notifier:
+                txt = (
+                    f"<b>Signal</b> {candidate['side']} {SYMBOL} ({INTERVAL})\n"
+                    f"Price: <code>{candidate['level']:.4f}</code>\n"
+                    f"Stop: <code>{candidate['stop']:.4f}</code>  Take: <code>{candidate['take']:.4f}</code>\n"
+                    f"Reason: <i>{candidate['reason']}</i>"
+                )
+                asyncio.create_task(self.notifier.send(txt))
             return candidate
 
         return None
+
+    # ---------- SMC helpers ----------
+    async def _smc_alerts(self, candles: List[Dict[str, Any]]) -> None:
+        """Approximate Pine SMC alerts: swing/internal BOS/CHoCH, FVG, EQH/EQL."""
+        if len(candles) < max(SWINGS_LENGTH * 2 + 5, 10):
+            return
+        last_close = candles[-1]['close']
+        last_ts = candles[-1]['timestamp']
+        atr200 = Indicators.atr(candles, 200) or 0.0
+
+        # Compute last confirmed swing pivots (using symmetrical lookback)
+        # Swing pivot index is len-1-SWINGS_LENGTH to ensure we have right-side bars for confirmation
+        swing_idx = len(candles) - 1 - SWINGS_LENGTH
+        if swing_idx > 0 and swing_idx + SWINGS_LENGTH < len(candles):
+            if Indicators.is_pivot_high(candles, swing_idx, SWINGS_LENGTH):
+                level = candles[swing_idx]['high']
+                if level != self.swing_high_level:
+                    self.swing_high_level = level
+                    self.swing_high_crossed = False
+            if Indicators.is_pivot_low(candles, swing_idx, SWINGS_LENGTH):
+                level = candles[swing_idx]['low']
+                if level != self.swing_low_level:
+                    self.swing_low_level = level
+                    self.swing_low_crossed = False
+
+        # Internal pivots with smaller lookback
+        internal_idx = len(candles) - 1 - INTERNAL_LENGTH
+        if internal_idx > 0 and internal_idx + INTERNAL_LENGTH < len(candles):
+            if Indicators.is_pivot_high(candles, internal_idx, INTERNAL_LENGTH):
+                level = candles[internal_idx]['high']
+                if level != self.internal_high_level:
+                    self.internal_high_level = level
+                    self.internal_high_crossed = False
+            if Indicators.is_pivot_low(candles, internal_idx, INTERNAL_LENGTH):
+                level = candles[internal_idx]['low']
+                if level != self.internal_low_level:
+                    self.internal_low_level = level
+                    self.internal_low_crossed = False
+
+        # Cross logic -> BOS/CHoCH
+        # Swing high cross
+        if self.swing_high_level is not None and not self.swing_high_crossed and last_close > self.swing_high_level:
+            tag = 'CHoCH' if self.swing_bias == -1 else 'BOS'
+            self.swing_high_crossed = True
+            self.swing_bias = 1
+            if self.notifier:
+                asyncio.create_task(self.notifier.send(f"<b>Swing Bullish {tag}</b> on {SYMBOL} ({INTERVAL})\nLevel: <code>{self.swing_high_level:.4f}</code>"))
+        # Swing low cross
+        if self.swing_low_level is not None and not self.swing_low_crossed and last_close < self.swing_low_level:
+            tag = 'CHoCH' if self.swing_bias == 1 else 'BOS'
+            self.swing_low_crossed = True
+            self.swing_bias = -1
+            if self.notifier:
+                asyncio.create_task(self.notifier.send(f"<b>Swing Bearish {tag}</b> on {SYMBOL} ({INTERVAL})\nLevel: <code>{self.swing_low_level:.4f}</code>"))
+
+        # Internal high cross
+        if self.internal_high_level is not None and not self.internal_high_crossed and last_close > self.internal_high_level:
+            tag = 'CHoCH' if self.internal_bias == -1 else 'BOS'
+            self.internal_high_crossed = True
+            self.internal_bias = 1
+            if self.notifier:
+                asyncio.create_task(self.notifier.send(f"<b>Internal Bullish {tag}</b> on {SYMBOL} ({INTERVAL})\nLevel: <code>{self.internal_high_level:.4f}</code>"))
+        # Internal low cross
+        if self.internal_low_level is not None and not self.internal_low_crossed and last_close < self.internal_low_level:
+            tag = 'CHoCH' if self.internal_bias == 1 else 'BOS'
+            self.internal_low_crossed = True
+            self.internal_bias = -1
+            if self.notifier:
+                asyncio.create_task(self.notifier.send(f"<b>Internal Bearish {tag}</b> on {SYMBOL} ({INTERVAL})\nLevel: <code>{self.internal_low_level:.4f}</code>"))
+
+        # FVG on current TF
+        if len(candles) >= 3:
+            c1 = candles[-3]
+            c3 = candles[-1]
+            if c3['low'] > c1['high']:
+                if self._last_fvg_ts != last_ts or self._last_fvg_type != 'FVG_LONG':
+                    self._last_fvg_ts = last_ts
+                    self._last_fvg_type = 'FVG_LONG'
+                    lower, upper = c1['high'], c3['low']
+                    if self.notifier:
+                        asyncio.create_task(self.notifier.send(f"<b>Bullish FVG</b> on {SYMBOL} ({INTERVAL})\nZone: <code>{lower:.4f} - {upper:.4f}</code>"))
+            elif c3['high'] < c1['low']:
+                if self._last_fvg_ts != last_ts or self._last_fvg_type != 'FVG_SHORT':
+                    self._last_fvg_ts = last_ts
+                    self._last_fvg_type = 'FVG_SHORT'
+                    lower, upper = c3['high'], c1['low']
+                    if self.notifier:
+                        asyncio.create_task(self.notifier.send(f"<b>Bearish FVG</b> on {SYMBOL} ({INTERVAL})\nZone: <code>{lower:.4f} - {upper:.4f}</code>"))
+
+        # Equal Highs / Lows
+        # Use last two swing highs/lows from small lookback to approximate
+        hs, ls = Indicators.find_swings(candles, lookback=EQUAL_LENGTH)
+        if atr200 > 0 and len(hs) >= 2:
+            d = abs(hs[-1]['price'] - hs[-2]['price'])
+            if d <= EQUAL_THRESHOLD * atr200 and (self._last_equal_high_ts != hs[-1]['timestamp']):
+                self._last_equal_high_ts = hs[-1]['timestamp']
+                if self.notifier:
+                    asyncio.create_task(self.notifier.send(f"<b>Equal Highs</b> on {SYMBOL} ({INTERVAL})\nLevel: <code>{hs[-1]['price']:.4f}</code>"))
+        if atr200 > 0 and len(ls) >= 2:
+            d = abs(ls[-1]['price'] - ls[-2]['price'])
+            if d <= EQUAL_THRESHOLD * atr200 and (self._last_equal_low_ts != ls[-1]['timestamp']):
+                self._last_equal_low_ts = ls[-1]['timestamp']
+                if self.notifier:
+                    asyncio.create_task(self.notifier.send(f"<b>Equal Lows</b> on {SYMBOL} ({INTERVAL})\nLevel: <code>{ls[-1]['price']:.4f}</code>"))
 
     def on_position_update(self, pos_side: Optional[str]):
         self.position = pos_side
@@ -547,7 +746,8 @@ class Executor:
 async def main_loop():
     logger.info("Запуск основного цикла")
     market = MarketData(SYMBOL, INTERVAL)
-    strategy = Strategy(market)
+    notifier = TelegramNotifier(TG_BOT_TOKEN, TG_CHAT_ID)
+    strategy = Strategy(market, notifier=notifier)
     executor = Executor(API_KEY, API_SECRET)
 
     # Инициализация историей до старта WS
