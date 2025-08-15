@@ -44,14 +44,38 @@ def read_api_credentials(file_path: str = 'api.txt') -> Tuple[Optional[str], Opt
         logger.error("Ошибка чтения %s: %s", file_path, e)
         return None, None
 
+# Новая функция: читаем Telegram токен/чат из api.txt
+def read_telegram_credentials(file_path: str = 'api.txt') -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not os.path.exists(file_path):
+            return None, None
+        token = None
+        chat_id = None
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('TG_BOT_TOKEN='):
+                    token = line.split('=', 1)[1].strip()
+                elif line.startswith('TG_CHAT_ID='):
+                    chat_id = line.split('=', 1)[1].strip()
+        return token, chat_id
+    except Exception as e:
+        logger.error("Ошибка чтения %s: %s", file_path, e)
+        return None, None
+
 SYMBOL = os.getenv('SYMBOL', 'BTC-USDT')
 INTERVAL = os.getenv('INTERVAL', '15m')
 USE_TESTNET = os.getenv('USE_TESTNET', 'false').lower() in ('1', 'true', 'yes')
 API_KEY, API_SECRET = read_api_credentials()
 
-# Telegram notif config
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN')
-TG_CHAT_ID = os.getenv('TG_CHAT_ID')  # numeric chat id or @channelusername
+# Telegram notif config: сначала ENV, затем fallback к api.txt
+TG_BOT_TOKEN_ENV = os.getenv('TG_BOT_TOKEN')
+TG_CHAT_ID_ENV = os.getenv('TG_CHAT_ID')
+TG_FILE_TOKEN, TG_FILE_CHAT = read_telegram_credentials()
+TG_BOT_TOKEN = TG_BOT_TOKEN_ENV or TG_FILE_TOKEN
+TG_CHAT_ID = TG_CHAT_ID_ENV or TG_FILE_CHAT
 
 # BingX V2 endpoints
 WS_REST_PUBLIC = 'wss://open-api-ws.bingx.com/market'
